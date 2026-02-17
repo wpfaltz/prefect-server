@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: prefect-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: prefect
+      POSTGRES_PASSWORD: prefect
+      POSTGRES_DB: prefect
+    volumes:
+      - prefect_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prefect -d prefect"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  prefect-server:
+    image: prefecthq/prefect:3.6.15-python3.12
+    container_name: prefect-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["prefect", "server", "start", "--host", "0.0.0.0", "--port", "4200"]
+    environment:
+      - PREFECT_UI_API_URL=/api
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://prefect:prefect@postgres:5432/prefect
+    ports:
+      - "4200:4200"
+
+  fastflow-control-plane:
+    build: ./control_plane
+    container_name: fastflow-control-plane
+    restart: unless-stopped
+    environment:
+      CONTROL_PLANE_BASE_URL: "http://prefect-server.br:8008"
+      
+      # JWT assinado pelo servidor
+      AUTH_JWT_ALG: "RS256"
+      AUTH_JWT_PRIVATE_KEY_PATH: "/run/secrets/jwt_private.pem"
+      AUTH_JWT_PUBLIC_KEY_PATH: "/run/secrets/jwt_public.pem"
+      AUTH_JWT_KID: "fastflow-auth-1"
+      AUTH_JWT_EXP_MINUTES: "30"
+      AUTH_JWT_AUD: "fastflow"
+      AUTH_JWT_ISS: "fastflow-auth"
+
+      # Google OAuth
+      GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID}"
+      GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET}"
+      GOOGLE_REDIRECT_URI: "http://prefect-server.br:8008/auth/callback"
+
+      AUTH_SERVICE_SECRET: "${AUTH_SERVICE_SECRET}"
+
+      KEYVAULT_MASTER_KEY: "${KEYVAULT_MASTER_KEY}"
+      KEYVAULT_ADMIN_EMAILS: "${KEYVAULT_ADMIN_EMAILS}"
+
+      CONTROL_PLANE_DB_URL: "postgresql+psycopg://fastflow_cp:${FASTFLOW_CP_DB_PASSWORD}@postgres:5432/fastflow_control_plane"
+
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8008"
+
+    volumes:
+    - ./auth/keys/jwt_private.pem:/run/secrets/jwt_private.pem:ro
+    - ./auth/keys/jwt_public.pem:/run/secrets/jwt_public.pem:ro
+    ports:
+      - "8008:8008"
+
+volumes:
+  prefect_pgdata:
