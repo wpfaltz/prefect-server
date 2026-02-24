@@ -2,7 +2,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from sqlalchemy import text
 from app.routers import auth, vault
-from app.db.session import engine
+from app.db.session import get_engine
 
 app = FastAPI(title="FastFlow Control Plane")
 
@@ -12,6 +12,7 @@ app.include_router(vault.router, prefix="/vault", tags=["vault"])
 @app.on_event("startup")
 def _startup() -> None:
     # Só valida conexão (migrations são responsabilidade do Alembic)
+    engine = get_engine()
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
 

@@ -6,10 +6,19 @@ from app.core.settings import settings
 class Base(DeclarativeBase):
     pass
 
-def get_engine():
-    if not settings.DB_URL:
-        raise RuntimeError("CONTROL_PLANE_DB_URL not configured.")
-    return create_engine(settings.DB_URL, pool_pre_ping=True)
+_engine = None
+_SessionLocal = None
 
-engine = get_engine()
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+def get_engine():
+    global _engine
+    if _engine is None:
+        if not settings.DB_URL:
+            raise RuntimeError("CONTROL_PLANE_DB_URL not configured.")
+        _engine = create_engine(settings.DB_URL, pool_pre_ping=True)
+    return _engine
+
+def get_sessionmaker():
+    global _SessionLocal
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(bind=get_engine(), autoflush=False, autocommit=False)
+    return _SessionLocal

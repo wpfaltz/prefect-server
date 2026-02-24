@@ -33,6 +33,9 @@ services:
     build: ./control_plane
     container_name: fastflow-control-plane
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       CONTROL_PLANE_BASE_URL: "http://prefect-server.br:8008"
       
@@ -55,17 +58,29 @@ services:
       KEYVAULT_MASTER_KEY: "${KEYVAULT_MASTER_KEY}"
       KEYVAULT_ADMIN_EMAILS: "${KEYVAULT_ADMIN_EMAILS}"
 
-      CONTROL_PLANE_DB_URL: "postgresql+psycopg://fastflow_cp:${FASTFLOW_CP_DB_PASSWORD}@postgres:5432/fastflow_control_plane"
+      CONTROL_PLANE_DB_URL: "${CONTROL_PLANE_DB_URL}"
 
     command: >
       sh -c "alembic upgrade head &&
              uvicorn app.main:app --host 0.0.0.0 --port 8008"
 
     volumes:
-    - ./auth/keys/jwt_private.pem:/run/secrets/jwt_private.pem:ro
-    - ./auth/keys/jwt_public.pem:/run/secrets/jwt_public.pem:ro
+    - ./control_plane/keys/jwt_private.pem:/run/secrets/jwt_private.pem:ro
+    - ./control_plane/keys/jwt_public.pem:/run/secrets/jwt_public.pem:ro
     ports:
       - "8008:8008"
+  
+  fastflow-dashboard:
+    build: ./control_plane/dashboard
+    container_name: fastflow-dashboard
+    restart: unless-stopped
+    depends_on:
+      fastflow-control-plane:
+        condition: service_started
+    environment:
+      CONTROL_PLANE_URL: "http://prefect-server.br:8008"
+    ports:
+      - "8501:8501"
 
 volumes:
   prefect_pgdata:

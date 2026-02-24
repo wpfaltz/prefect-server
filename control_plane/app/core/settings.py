@@ -33,7 +33,6 @@ class Settings:
 
     # Admin emails (vault admin endpoints)
     VAULT_ADMIN_EMAILS: set[str] = field(default_factory=set)
-    print(VAULT_ADMIN_EMAILS)
 
     DB_URL: str = os.getenv("CONTROL_PLANE_DB_URL", "")
 
