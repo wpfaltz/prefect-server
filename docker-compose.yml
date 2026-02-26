@@ -30,7 +30,7 @@ services:
       - "4200:4200"
 
   fastflow-control-plane:
-    build: ./control_plane
+    build: ./control_plane/backend
     container_name: fastflow-control-plane
     restart: unless-stopped
     depends_on:
@@ -65,8 +65,8 @@ services:
              uvicorn app.main:app --host 0.0.0.0 --port 8008"
 
     volumes:
-    - ./control_plane/keys/jwt_private.pem:/run/secrets/jwt_private.pem:ro
-    - ./control_plane/keys/jwt_public.pem:/run/secrets/jwt_public.pem:ro
+    - ./control_plane/backend/keys/jwt_private.pem:/run/secrets/jwt_private.pem:ro
+    - ./control_plane/backend/keys/jwt_public.pem:/run/secrets/jwt_public.pem:ro
     ports:
       - "8008:8008"
   
