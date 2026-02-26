@@ -7,11 +7,11 @@ import requests
 import streamlit as st
 
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://prefect-server.br:8008").rstrip("/")
-AUTH_TIMEOUT_MINUTES = int(os.getenv("AUTH_TIMEOUT_MINUTES", "30"))
+AUTH_TIMEOUT_MINUTES = int(os.getenv("AUTH_TIMEOUT_MINUTES", "2"))
 POLL_INTERVAL_SECONDS = float(os.getenv("AUTH_POLL_INTERVAL_SECONDS", "2"))
 
-st.set_page_config(page_title="FastFlow Dashboard", layout="wide")
-st.title("FastFlow Dashboard")
+st.set_page_config(page_title="FastFlow Key Vault Management Dashboard", layout="wide")
+st.title("FastFlow Key Vault Management Dashboard")
 
 
 # -------------------------
@@ -127,13 +127,21 @@ role = (me.get("role") or "user").lower()
 is_admin = role in ("admin", "service")
 
 # -------------------------
-# Tabs
+# Tabs: visibilidade
 # -------------------------
-tabs = ["Minha Conta"]
+tabs = ["Minha Conta", "Usuários", "Secrets", "Acessos (Mappings)"]
 if is_admin:
-    tabs += ["Usuários", "Secrets", "Acessos (Mappings)", "Auditoria"]
+    tabs += ["Auditoria"]
 
 chosen = st.tabs(tabs)
+
+# Helpers para mostrar erro de permissão amigável
+def show_forbidden_hint():
+    st.warning(
+        "Você não tem permissão no backend para este endpoint. "
+        "Se a intenção é permitir acesso por writer/reader, será necessário "
+        "ajustar as permissões/rotas no control-plane."
+    )
 
 
 # ---- Minha Conta
@@ -141,140 +149,142 @@ with chosen[0]:
     st.subheader("Minha Conta")
     st.write("Você está autenticado e pode usar o Key Vault conforme suas permissões.")
 
+# -------------------------
+# Usuários (Principals)
+# -------------------------
+with chosen[1]:
+    st.subheader("Usuários (Principals)")
 
-# ---- Admin tabs
-if is_admin:
-    # -------------------------
-    # Usuários (Principals)
-    # -------------------------
-    with chosen[1]:
-        st.subheader("Usuários (Principals)")
+    r = cp_get("/vault/principals", headers=api_headers())
+    if r.status_code == 403:
+        show_forbidden_hint()
+        st.stop()
+    if r.status_code != 200:
+        st.error(f"Erro ao listar usuários: {r.status_code} {r.text}")
+        st.stop()
+    
+    principals = r.json().get("principals", [])
+    st.dataframe(principals, use_container_width=True)
 
-        r = cp_get("/vault/admin/principals", headers=api_headers())
-        if r.status_code != 200:
-            st.error(f"Erro ao listar usuários: {r.status_code} {r.text}")
-        else:
-            principals = r.json().get("principals", [])
-            st.dataframe(principals, use_container_width=True)
-
-        st.markdown("### Criar/Atualizar usuário")
-        with st.form("upsert_principal"):
-            email = st.text_input("Email")
-            role_in = st.selectbox("Role", ["user", "reader", "writer", "admin", "service"])
-            status_in = st.selectbox("Status", ["active", "disabled"])
-            submitted = st.form_submit_button("Salvar")
-            if submitted:
-                rr = cp_post(
-                    "/vault/admin/principals",
-                    headers=api_headers(),
-                    json={"email": email, "role": role_in, "status": status_in},
-                )
-                if rr.status_code == 200:
-                    st.success("Salvo.")
-                    st.rerun()
-                else:
-                    st.error(f"Falha ao salvar: {rr.status_code} {rr.text}")
-
-    # -------------------------
-    # Secrets (reais)
-    # -------------------------
-    with chosen[2]:
-        st.subheader("Secrets Reais")
-
-        r = cp_get("/vault/admin/real-secrets", headers=api_headers())
-        if r.status_code != 200:
-            st.error(f"Erro ao listar secrets: {r.status_code} {r.text}")
-        else:
-            st.dataframe(r.json().get("secrets", []), use_container_width=True)
-
-        st.markdown("### Criar/Atualizar secret real")
-        with st.form("upsert_real_secret"):
-            real_name = st.text_input("real_secret_name (ex: oracle_pwd_writer)")
-            value = st.text_input("valor (será criptografado)", type="password")
-            enabled = st.checkbox("enabled", value=True)
-            assign_level = st.selectbox("assign_level", ["reader", "writer", "admin"])
-            submitted = st.form_submit_button("Salvar")
-            if submitted:
-                rr = cp_post(
-                    "/vault/admin/real-secrets",
-                    headers=api_headers(),
-                    json={
-                        "real_secret_name": real_name,
-                        "value": value,
-                        "enabled": enabled,
-                        "assign_level": assign_level,
-                    },
-                )
-                if rr.status_code == 200:
-                    st.success("Salvo.")
-                    st.rerun()
-                else:
-                    st.error(f"Falha ao salvar: {rr.status_code} {rr.text}")
-
-    # -------------------------
-    # Mappings (Bulk save)
-    # -------------------------
-    with chosen[3]:
-        st.subheader("Acessos (generic_secret → real_secret por usuário)")
-
-        target_email = st.text_input("Email do usuário para editar mappings", "")
-        if target_email:
-            rr = cp_get(
-                "/vault/admin/mappings",
+    st.markdown("### Criar/Atualizar usuário")
+    with st.form("upsert_principal"):
+        email = st.text_input("Email")
+        role_in = st.selectbox("Role", ["admin", "service", "writer", "reader", "user"])
+        status_in = st.selectbox("Status", ["active", "disabled"])
+        submitted = st.form_submit_button("Salvar")
+        if submitted:
+            rr = cp_post(
+                "/vault/principals",
                 headers=api_headers(),
-                params={"target_email": target_email},
+                json={"email": email, "role": role_in, "status": status_in},
             )
-            if rr.status_code != 200:
-                st.error(f"Erro ao buscar mappings: {rr.status_code} {rr.text}")
+            if rr.status_code == 200:
+                st.success("Salvo.")
+                st.rerun()
             else:
-                mappings = rr.json().get("mappings", [])
+                st.error(f"Falha ao salvar: {rr.status_code} {rr.text}")
 
-                default_row = {
-                    "email": target_email.lower().strip(),
-                    "generic_secret": "",
-                    "real_secret_name": "",
-                    "active": True,
+# -------------------------
+# Secrets (reais)
+# -------------------------
+with chosen[2]:
+    st.subheader("Secrets Reais")
+
+    r = cp_get("/vault/real-secrets", headers=api_headers())
+    if r.status_code != 200:
+        st.error(f"Erro ao listar secrets: {r.status_code} {r.text}")
+    else:
+        st.dataframe(r.json().get("secrets", []), use_container_width=True)
+
+    st.markdown("### Criar/Atualizar secret real")
+    with st.form("upsert_real_secret"):
+        real_name = st.text_input("real_secret_name (ex: oracle_pwd_writer)")
+        value = st.text_input("valor (será criptografado)", type="password")
+        enabled = st.checkbox("enabled", value=True)
+        assign_level = st.selectbox("assign_level", ["reader", "writer", "admin"])
+        submitted = st.form_submit_button("Salvar")
+        if submitted:
+            rr = cp_post(
+                "/vault/real-secrets",
+                headers=api_headers(),
+                json={
+                    "real_secret_name": real_name,
+                    "value": value,
+                    "enabled": enabled,
+                    "assign_level": assign_level,
+                },
+            )
+            if rr.status_code == 200:
+                st.success("Salvo.")
+                st.rerun()
+            else:
+                st.error(f"Falha ao salvar: {rr.status_code} {rr.text}")
+
+# -------------------------
+# Mappings (Bulk save)
+# -------------------------
+with chosen[3]:
+    st.subheader("Acessos (generic_secret → real_secret por usuário)")
+
+    target_email = st.text_input("Email do usuário para editar mappings", "")
+    if target_email:
+        rr = cp_get(
+            "/vault/mappings",
+            headers=api_headers(),
+            params={"target_email": target_email},
+        )
+        if rr.status_code != 200:
+            st.error(f"Erro ao buscar mappings: {rr.status_code} {rr.text}")
+        else:
+            mappings = rr.json().get("mappings", [])
+
+            default_row = {
+                "email": target_email.lower().strip(),
+                "generic_secret": "",
+                "real_secret_name": "",
+                "active": True,
+            }
+
+            edited = st.data_editor(
+                mappings if mappings else [default_row],
+                use_container_width=True,
+                num_rows="dynamic",
+                key="mappings_editor",
+            )
+
+            if st.button("Salvar alterações de mappings"):
+                # bulk endpoint
+                payload = {
+                    "items": [
+                        {
+                            "email": target_email,
+                            "generic_secret": (row.get("generic_secret") or "").strip(),
+                            "real_secret_name": (row.get("real_secret_name") or "").strip(),
+                            "active": bool(row.get("active", True)),
+                        }
+                        for row in edited
+                        if (row.get("generic_secret") or "").strip()
+                        and (row.get("real_secret_name") or "").strip()
+                    ]
                 }
 
-                edited = st.data_editor(
-                    mappings if mappings else [default_row],
-                    use_container_width=True,
-                    num_rows="dynamic",
-                    key="mappings_editor",
+                resp = cp_post(
+                    "/vault/admin/mappings/bulk",
+                    headers=api_headers(),
+                    json=payload,
                 )
 
-                if st.button("Salvar alterações de mappings"):
-                    # bulk endpoint
-                    payload = {
-                        "items": [
-                            {
-                                "email": target_email,
-                                "generic_secret": (row.get("generic_secret") or "").strip(),
-                                "real_secret_name": (row.get("real_secret_name") or "").strip(),
-                                "active": bool(row.get("active", True)),
-                            }
-                            for row in edited
-                            if (row.get("generic_secret") or "").strip()
-                            and (row.get("real_secret_name") or "").strip()
-                        ]
-                    }
+                if resp.status_code == 200:
+                    saved = resp.json().get("saved", 0)
+                    st.success(f"Salvos {saved} mappings.")
+                    st.rerun()
+                else:
+                    st.error(f"Falha no bulk save: {resp.status_code} {resp.text}")
 
-                    resp = cp_post(
-                        "/vault/admin/mappings/bulk",
-                        headers=api_headers(),
-                        json=payload,
-                    )
-
-                    if resp.status_code == 200:
-                        saved = resp.json().get("saved", 0)
-                        st.success(f"Salvos {saved} mappings.")
-                        st.rerun()
-                    else:
-                        st.error(f"Falha no bulk save: {resp.status_code} {resp.text}")
-
-    # -------------------------
-    # Auditoria
-    # -------------------------
+# -------------------------
+# Auditoria (somente admins)
+# -------------------------
+if is_admin:
     with chosen[4]:
         st.subheader("Auditoria")
         r = cp_get("/vault/admin/audit", headers=api_headers(), params={"limit": 200})

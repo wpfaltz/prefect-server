@@ -11,9 +11,31 @@ from app.core.settings import settings
 from app.services.jwt_service import verify_token
 from app.services.vault_crypto import encrypt, decrypt
 from app.services import vault_repo
-from app.services.rbac import can_set_mapping, can_assign_secret
+from app.services.rbac import can_set_mapping, can_assign_secret, can_modify_principal, ROLE_RANK
 
 router = APIRouter()
+
+class RealSecretUpsert(BaseModel):
+    real_secret_name: str
+    value: str
+    enabled: bool = True
+    assign_level: str = "reader"  # reader|writer|admin
+
+
+class PrincipalUpsert(BaseModel):
+    email: str
+    role: str = "user"      # user/reader/writer/admin/service (você decide)
+    status: str = "active"  # active/disabled
+
+class MappingItem(BaseModel):
+    email: str
+    generic_secret: str
+    real_secret_name: str
+    active: bool = True
+
+
+class MappingsBulk(BaseModel):
+    items: list[MappingItem]
 
 
 def _get_identity(authorization: str | None) -> tuple[str, str, int]:
@@ -27,8 +49,6 @@ def _get_identity(authorization: str | None) -> tuple[str, str, int]:
         payload = verify_token(token)
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-
-    print(f"payload: {payload}")
 
     email = str(payload.get("email", "")).lower()
     role = str(payload.get("role", "user"))
@@ -167,25 +187,17 @@ def read_secrets_bulk(
     return {"secrets": result}
 
 
-class RealSecretUpsert(BaseModel):
-    real_secret_name: str
-    value: str
-    enabled: bool = True
-    assign_level: str = "reader"  # reader|writer|admin
-
-
-
-@router.post("/admin/real-secrets")
+@router.post("/real-secrets")
 def admin_upsert_real_secret(
     payload: RealSecretUpsert,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
     now = int(time.time())
-    actor_email, role, _iat, p = _get_actor(db, authorization)
+    actor_email, actor_role, _iat, p = _get_actor(db, authorization)
 
     # 1) só quem pode "set mapping" pode também "gerir secrets" (writer/admin/service)
-    if not can_set_mapping(role):
+    if not can_set_mapping(actor_role):
         raise HTTPException(status_code=403, detail="Not allowed to manage secrets.")
 
     # 2) valida assign_level do payload
@@ -194,7 +206,7 @@ def admin_upsert_real_secret(
         raise HTTPException(status_code=400, detail="assign_level must be one of: reader, writer, admin.")
 
     # 3) writer não pode criar/editar secrets com assign_level=admin
-    if not can_assign_secret(role, assign_level):
+    if not can_assign_secret(actor_role, assign_level):
         raise HTTPException(status_code=403, detail="Not allowed to set this assign_level.")
 
     # 4) se já existe secret, writer também não pode "subir o nível" dele para admin
@@ -202,11 +214,11 @@ def admin_upsert_real_secret(
     if existing is not None:
         existing_level = getattr(existing, "assign_level", "admin")  # fallback caso campo não exista ainda
         # writer não pode editar secret que é "admin-only"
-        if role == "writer" and existing_level == "admin":
+        if actor_role == "writer" and existing_level == "admin":
             raise HTTPException(status_code=403, detail="Writer cannot edit admin-level secrets.")
 
         # writer não pode promover assign_level para admin
-        if role == "writer" and assign_level == "admin":
+        if actor_role == "writer" and assign_level == "admin":
             raise HTTPException(status_code=403, detail="Writer cannot promote secrets to admin level.")
 
     # 5) grava (precisa que vault_repo.upsert_real_secret suporte assign_level)
@@ -226,72 +238,10 @@ def admin_upsert_real_secret(
         action="upsert_real_secret",
         status="ok",
         real_secret_name=payload.real_secret_name,
-        details=f"enabled={payload.enabled} assign_level={assign_level} actor_role={role}",
+        details=f"enabled={payload.enabled} assign_level={assign_level} actor_role={actor_role}",
     )
     return {"status": "ok", "real_secret_name": payload.real_secret_name}
 
-
-
-# class MappingSet(BaseModel):
-#     email: str
-#     generic_secret: str
-#     real_secret_name: str
-#     active: bool = True
-
-
-# @router.post("/admin/mapping")
-# def admin_set_mapping(
-#     payload: MappingSet,
-#     authorization: str | None = Header(default=None),
-#     db: Session = Depends(get_db),
-# ):
-#     now = int(time.time())
-#     actor_email, role, _ = _get_identity(authorization)
-
-#     # 1) writer/admin/service podem alterar mapping; reader não
-#     if not can_set_mapping(role):
-#         raise HTTPException(status_code=403, detail="Not allowed to change mappings.")
-
-#     # 2) o real_secret alvo precisa existir
-#     real = vault_repo.get_secret(db, payload.real_secret_name)
-#     if not real:
-#         raise HTTPException(status_code=404, detail="Real secret not found.")
-
-#     # 3) checa se o role do ator pode atribuir esse secret
-#     # (precisa do campo real.assign_level no model Secret)
-#     if not can_assign_secret(role, getattr(real, "assign_level", "admin")):
-#         raise HTTPException(status_code=403, detail="Not allowed to assign this real secret.")
-
-#     # (opcional, mas recomendado) impedir writer de mexer em admins/writers
-#     target = vault_repo.get_principal(db, payload.email)
-#     if target and role == "writer" and target.role in ("admin", "writer", "service"):
-#         raise HTTPException(status_code=403, detail="Writer cannot change mappings for admin/writer users.")
-
-#     # garante principal existir (ativa) — aqui eu prefiro NÃO sobrescrever role do alvo
-#     if not target:
-#         vault_repo.ensure_principal(db, payload.email, role="user", status="active", now=now)
-
-#     # salva mapping
-#     vault_repo.set_mapping(
-#         db,
-#         email=payload.email,
-#         generic_secret=payload.generic_secret,
-#         real_secret_name=payload.real_secret_name,
-#         updated_at=now,
-#         active=payload.active,
-#     )
-
-#     vault_repo.audit(
-#         db,
-#         ts=now,
-#         email=actor_email,
-#         action="set_mapping",
-#         status="ok",
-#         generic_secret=payload.generic_secret,
-#         real_secret_name=payload.real_secret_name,
-#         details=f"target={payload.email.lower()} role={role}",
-#     )
-#     return {"status": "ok"}
 
 
 @router.get("/admin/audit")
@@ -320,15 +270,19 @@ def admin_audit(
     }
 
 
-@router.get("/admin/principals")
+@router.get("/principals")
 def admin_list_principals(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    actor_email, role, _iat, p = _get_actor(db, authorization)
-    _require_admin(actor_email, role)
-
+    actor_email, actor_role, _iat, actor_p = _get_actor(db, authorization)
     rows = db.execute(select(Principal).order_by(Principal.email.asc())).scalars().all()
+
+    def rank(r: str) -> int:
+        return ROLE_RANK.get((r or "user").lower(), 0)
+
+    actor_rank = rank(actor_role)
+
     return {
         "principals": [
             {
@@ -344,21 +298,18 @@ def admin_list_principals(
     }
 
 
-class PrincipalUpsert(BaseModel):
-    email: str
-    role: str = "user"      # user/reader/writer/admin/service (você decide)
-    status: str = "active"  # active/disabled
-
-
-@router.post("/admin/principals")
+@router.post("/principals")
 def admin_upsert_principal(
     payload: PrincipalUpsert,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
     now = int(time.time())
-    actor_email, role, _iat, p = _get_actor(db, authorization)
-    _require_admin(actor_email, role)
+    actor_email, actor_role, _iat, p = _get_actor(db, authorization)
+
+    # reader/user não pode gerir usuários
+    if actor_role not in ("admin", "service", "writer"):
+        raise HTTPException(status_code=403, detail="Not allowed to manage users.")
 
     email = payload.email.strip().lower()
     if not email or "@" not in email:
@@ -372,14 +323,24 @@ def admin_upsert_principal(
 
     if new_role not in ("user", "reader", "writer", "admin", "service"):
         raise HTTPException(status_code=400, detail="role must be user|reader|writer|admin|service")
+    
+    # não permitir atribuir role acima do ator
+    if ROLE_RANK.get(new_role, 0) > ROLE_RANK.get(actor_role, 0):
+        raise HTTPException(status_code=403, detail="Cannot assign a role higher than your own.")
 
-    # upsert
-    p = db.get(Principal, email)
-    if p:
-        p.role = payload.role.strip().lower()
-        p.status = payload.status.strip().lower()
-        p.updated_at = now
+    target = db.get(Principal, email)
+
+    # se existe: não pode modificar alguém do mesmo nível ou superior
+    if target:
+        if not can_modify_principal(actor_role, target.role):
+            raise HTTPException(status_code=403, detail="Cannot modify users with higher role.")
+
+        target.role = new_role
+        target.status = new_status
+        target.updated_at = now
+        p = target
     else:
+        # criar novo usuário: ok, desde que role <= ator (já validado)
         p = Principal(
             email=email,
             role=new_role,
@@ -404,15 +365,17 @@ def admin_upsert_principal(
     return {"status": "ok", "email": email}
 
 
-@router.get("/admin/real-secrets")
+@router.get("/real-secrets")
 def admin_list_real_secrets(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    actor_email, role, _iat, p = _get_actor(db, authorization)
-    _require_admin(actor_email, role)
+    actor_email, actor_role, _iat, _p = _get_actor(db, authorization)
 
     rows = db.execute(select(Secret).order_by(Secret.real_secret_name.asc())).scalars().all()
+
+    filtered = [s for s in rows if can_assign_secret(actor_role, (s.assign_level or "admin"))]
+
     return {
         "secrets": [
             {
@@ -421,23 +384,30 @@ def admin_list_real_secrets(
                 "updated_at": s.updated_at,
                 "assign_level": s.assign_level,
             }
-            for s in rows
+            for s in filtered
         ]
     }
 
 
-@router.get("/admin/mappings")
+@router.get("/mappings")
 def admin_list_mappings(
     target_email: str,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    actor_email, role, _iat, p = _get_actor(db, authorization)
-    _require_admin(actor_email, role)
+    actor_email, actor_role, _iat, _p = _get_actor(db, authorization)
 
     email = target_email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Invalid target_email.")
+
+    target = vault_repo.get_principal(db, email)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target principal not found.")
+
+    # só pode acessar mappings de users com role <= a sua
+    if ROLE_RANK.get(target.role, 0) > ROLE_RANK.get(actor_role, 0):
+        raise HTTPException(status_code=403, detail="Not allowed to view mappings for this user.")
 
     rows = db.execute(
         select(SecretMapping)
@@ -459,26 +429,17 @@ def admin_list_mappings(
     }
 
 
-class MappingItem(BaseModel):
-    email: str
-    generic_secret: str
-    real_secret_name: str
-    active: bool = True
-
-
-class MappingsBulk(BaseModel):
-    items: list[MappingItem]
-
-
-@router.post("/admin/mappings/bulk")
+@router.post("/mappings/bulk")
 def admin_set_mappings_bulk(
     payload: MappingsBulk,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
     now = int(time.time())
-    actor_email, role, _iat, p = _get_actor(db, authorization)
-    _require_admin(actor_email, role)
+    actor_email, actor_role, _iat, _p = _get_actor(db, authorization)
+
+    if not can_set_mapping(actor_role):
+        raise HTTPException(status_code=403, detail="Not allowed to change mappings.")
 
     if not payload.items:
         return {"status": "ok", "saved": 0}
@@ -487,27 +448,20 @@ def admin_set_mappings_bulk(
     if not target_email or "@" not in target_email:
         raise HTTPException(status_code=400, detail="Invalid email in items[0].")
 
-    # força bulk para um único email (melhor para UI)
     for it in payload.items:
         if it.email.strip().lower() != target_email:
             raise HTTPException(status_code=400, detail="Bulk must target a single email.")
 
-    # garante principal existir (não sobrescreve role/status se já existir)
-    if not db.get(Principal, target_email):
-        db.add(
-            Principal(
-                email=target_email,
-                role="user",
-                status="active",
-                created_at=now,
-                updated_at=now,
-                token_valid_after=0,
-            )
-        )
-        db.flush()
+    target = vault_repo.get_principal(db, target_email)
+    if not target:
+        # cria como user ativo
+        target = vault_repo.ensure_principal(db, target_email, role="user", status="active", now=now)
+
+    # não pode mexer em target de role superior
+    if ROLE_RANK.get(target.role, 0) > ROLE_RANK.get(actor_role, 0):
+        raise HTTPException(status_code=403, detail="Not allowed to modify mappings for this user.")
 
     saved = 0
-
     try:
         for it in payload.items:
             gs = it.generic_secret.strip()
@@ -515,9 +469,13 @@ def admin_set_mappings_bulk(
             if not gs or not rs:
                 continue
 
-            # real secret precisa existir
-            if not db.get(Secret, rs):
+            real = db.get(Secret, rs)
+            if not real:
                 raise HTTPException(status_code=404, detail=f"Real secret not found: {rs}")
+
+            # não pode atribuir secret acima do nível do ator
+            if not can_assign_secret(actor_role, real.assign_level):
+                raise HTTPException(status_code=403, detail=f"Not allowed to assign secret: {rs}")
 
             key = {"email": target_email, "generic_secret": gs}
             m = db.get(SecretMapping, key)
@@ -551,7 +509,7 @@ def admin_set_mappings_bulk(
         email=actor_email,
         action="set_mappings_bulk",
         status="ok",
-        details=f"target={target_email} saved={saved}",
+        details=f"target={target_email} saved={saved} actor_role={actor_role}",
     )
 
     return {"status": "ok", "saved": saved, "target_email": target_email}

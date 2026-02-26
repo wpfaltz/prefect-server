@@ -1,4 +1,5 @@
 ROLE_RANK = {
+    "user": 0,
     "reader": 1,
     "writer": 2,
     "admin": 3,
@@ -22,6 +23,6 @@ def can_assign_secret(actor_role: str, secret_assign_level: str) -> bool:
 
 def can_modify_principal(actor_role: str, target_role: str) -> bool:
     """
-    Impede que alguém modifique usuário de mesmo nível ou superior.
+    Impede que alguém modifique usuário de nível superior.
     """
-    return ROLE_RANK.get(actor_role, 0) > ROLE_RANK.get(target_role, 0)
+    return ROLE_RANK.get(actor_role, 0) >= ROLE_RANK.get(target_role, 0)
