@@ -18,24 +18,79 @@ st.title("FastFlow Key Vault Management Dashboard")
 # HTTP helpers
 # -------------------------
 def api_headers() -> dict[str, str]:
+    """Constrói o dicionário de headers HTTP para requisições autenticadas.
+
+    Verifica se existe um JWT armazenado na sessão do Streamlit e,
+    em caso positivo, retorna um dicionário com o header
+    ``Authorization: Bearer <jwt>``. Caso contrário, retorna um
+    dicionário vazio.
+
+    Returns:
+        dict[str, str]: Headers HTTP contendo o token de autenticação
+            (se disponível) ou dicionário vazio.
+    """
     token = st.session_state.get("jwt")
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def cp_get(path: str, **kwargs: Any):
+    """Realiza uma requisição HTTP GET ao control-plane.
+
+    Wrapper simplificado que concatena a URL base do control-plane
+    (``CONTROL_PLANE_URL``) com o caminho fornecido e executa um
+    ``requests.get`` com timeout de 20 segundos.
+
+    Args:
+        path: Caminho relativo do endpoint (ex: ``/vault/me``).
+        **kwargs: Parâmetros adicionais repassados a ``requests.get``
+            (ex: ``headers``, ``params``).
+
+    Returns:
+        requests.Response: Objeto de resposta HTTP.
+    """
     return requests.get(f"{CONTROL_PLANE_URL}{path}", timeout=20, **kwargs)
 
 
 def cp_post(path: str, **kwargs: Any):
+    """Realiza uma requisição HTTP POST ao control-plane.
+
+    Wrapper simplificado que concatena a URL base do control-plane
+    (``CONTROL_PLANE_URL``) com o caminho fornecido e executa um
+    ``requests.post`` com timeout de 20 segundos.
+
+    Args:
+        path: Caminho relativo do endpoint (ex: ``/auth/ticket``).
+        **kwargs: Parâmetros adicionais repassados a ``requests.post``
+            (ex: ``headers``, ``json``).
+
+    Returns:
+        requests.Response: Objeto de resposta HTTP.
+    """
     return requests.post(f"{CONTROL_PLANE_URL}{path}", timeout=20, **kwargs)
 
 
 def invalidate_session():
+    """Invalida a sessão de autenticação do usuário no Streamlit.
+
+    Remove o JWT e os dados do usuário (``me``) do
+    ``st.session_state``, efetivamente realizando o logout local.
+    Não revoga o token no servidor.
+    """
     st.session_state["jwt"] = None
     st.session_state["me"] = None
 
 
 def load_me():
+    """Carrega os dados do usuário autenticado a partir do control-plane.
+
+    Faz uma requisição GET a ``/vault/me`` com o token JWT armazenado
+    na sessão. Se o token estiver expirado (HTTP 401), invalida a
+    sessão automaticamente.
+
+    Returns:
+        dict | None: Dicionário com ``email``, ``role`` e ``status``
+            do usuário autenticado, ou ``None`` em caso de falha.
+    """
     r = cp_get("/vault/me", headers=api_headers())
     if r.status_code == 401:
         invalidate_session()
@@ -49,6 +104,23 @@ def load_me():
 # Auth flow: ticket + poll
 # -------------------------
 def login_flow() -> bool:
+    """Executa o fluxo completo de login via Google OAuth com polling.
+
+    Etapas realizadas:
+    1. Cria um ticket de autenticação via ``POST /auth/ticket``.
+    2. Exibe a URL de login e tenta abrir o navegador automaticamente.
+    3. Realiza polling periódico em ``GET /auth/poll`` até que o login
+       seja concluído ou o timeout seja atingido.
+    4. Armazena o JWT recebido no ``st.session_state`` em caso de sucesso.
+
+    O timeout é configurado pela variável de ambiente
+    ``AUTH_TIMEOUT_MINUTES`` (padrão: 2 minutos) e o intervalo de
+    polling por ``AUTH_POLL_INTERVAL_SECONDS`` (padrão: 2 segundos).
+
+    Returns:
+        bool: ``True`` se o login foi concluído com sucesso,
+            ``False`` em caso de erro ou timeout.
+    """
     r = cp_post("/auth/ticket")
     if r.status_code != 200:
         st.error(f"Falha ao criar ticket: {r.status_code} {r.text}")
@@ -137,6 +209,12 @@ chosen = st.tabs(tabs)
 
 # Helpers para mostrar erro de permissão amigável
 def show_forbidden_hint():
+    """Exibe uma mensagem amigável de permissão insuficiente.
+
+    Mostra um aviso (``st.warning``) informando ao usuário que ele
+    não tem permissão no backend para acessar o endpoint solicitado
+    e sugere que as permissões sejam ajustadas no control-plane.
+    """
     st.warning(
         "Você não tem permissão no backend para este endpoint. "
         "Se a intenção é permitir acesso por writer/reader, será necessário "

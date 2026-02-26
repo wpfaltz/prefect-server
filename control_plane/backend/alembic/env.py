@@ -27,6 +27,18 @@ target_metadata = Base.metadata
 # ... etc.
 
 def get_url() -> str:
+    """Obtém a URL de conexão do banco de dados para o Alembic.
+
+    Lê a variável de ambiente ``CONTROL_PLANE_DB_URL`` que deve conter
+    a URL SQLAlchemy válida para o banco de dados do control-plane.
+
+    Returns:
+        str: URL de conexão SQLAlchemy.
+
+    Raises:
+        RuntimeError: Se a variável ``CONTROL_PLANE_DB_URL`` não estiver
+            definida.
+    """
     url = os.getenv("CONTROL_PLANE_DB_URL", "")
     if not url:
         raise RuntimeError("CONTROL_PLANE_DB_URL not set for Alembic.")
@@ -57,6 +69,16 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    """Executa as migrations do Alembic em modo 'online'.
+
+    Cria uma engine SQLAlchemy a partir da configuração do ``alembic.ini``,
+    sobrescrevendo a ``sqlalchemy.url`` com o valor retornado por
+    ``get_url()``. Estabelece uma conexão real com o banco e executa
+    as migrations dentro de uma transação.
+
+    Este é o modo padrão quando o Alembic é executado normalmente
+    (não em modo offline).
+    """
     configuration = config.get_section(config.config_ini_section)
 
     # garante que é dict

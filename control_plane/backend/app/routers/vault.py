@@ -16,6 +16,15 @@ from app.services.rbac import can_set_mapping, can_assign_secret, can_modify_pri
 router = APIRouter()
 
 class RealSecretUpsert(BaseModel):
+    """Schema de entrada para criação/atualização de um segredo real.
+
+    Attributes:
+        real_secret_name: Nome único do segredo (identificador).
+        value: Valor em texto plano do segredo (será criptografado no servidor).
+        enabled: Se o segredo deve ficar habilitado para leitura.
+        assign_level: Nível mínimo de papel para atribuição
+            (``reader``, ``writer`` ou ``admin``).
+    """
     real_secret_name: str
     value: str
     enabled: bool = True
@@ -23,11 +32,27 @@ class RealSecretUpsert(BaseModel):
 
 
 class PrincipalUpsert(BaseModel):
+    """Schema de entrada para criação/atualização de um principal (usuário).
+
+    Attributes:
+        email: Endereço de e-mail do principal.
+        role: Papel a ser atribuído (``user``, ``reader``, ``writer``,
+            ``admin`` ou ``service``).
+        status: Estado da conta (``active`` ou ``disabled``).
+    """
     email: str
     role: str = "user"      # user/reader/writer/admin/service (você decide)
     status: str = "active"  # active/disabled
 
 class MappingItem(BaseModel):
+    """Schema de um item individual de mapeamento genérico → real.
+
+    Attributes:
+        email: E-mail do principal-alvo do mapeamento.
+        generic_secret: Nome genérico usado pelo flow/código.
+        real_secret_name: Nome real do segredo no vault.
+        active: Se o mapeamento deve ficar ativo.
+    """
     email: str
     generic_secret: str
     real_secret_name: str
@@ -35,12 +60,31 @@ class MappingItem(BaseModel):
 
 
 class MappingsBulk(BaseModel):
+    """Schema de entrada para salvar múltiplos mapeamentos de uma só vez.
+
+    Todos os itens devem pertencer ao mesmo e-mail (single-target bulk).
+
+    Attributes:
+        items: Lista de mapeamentos a serem criados/atualizados.
+    """
     items: list[MappingItem]
 
 
 def _get_identity(authorization: str | None) -> tuple[str, str, int]:
-    """
-    Returns: (email, role, iat)
+    """Extrai e valida a identidade do usuário a partir do header Authorization.
+
+    Faz o parse do token Bearer, verifica sua assinatura e validade
+    via ``verify_token`` e retorna os dados essenciais do payload.
+
+    Args:
+        authorization: Valor do header ``Authorization`` (ex: ``Bearer <jwt>``).
+
+    Returns:
+        tuple: ``(email, role, iat)`` extraídos do payload do token.
+
+    Raises:
+        HTTPException (401): Se o header estiver ausente, mal-formado,
+            ou o token for inválido/expirado.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token.")
@@ -62,9 +106,22 @@ def _get_actor(
     db: Session,
     authorization: str | None,
 ) -> tuple[str, str, int, Principal]:
-    """
-    Returns: (email, effective_role_from_db, iat, principal)
-    Token role is ignored for authorization; DB is the source of truth.
+    """Identifica e retorna o ator autenticado com seu papel efetivo do banco.
+
+    Diferente de ``_get_identity``, este método consulta o banco de dados
+    para obter o papel (role) real do principal, ignorando o papel
+    declarado no token. Também realiza auto-registro de novos usuários
+    e garante que bootstrap admins tenham role ``admin`` no banco.
+
+    Args:
+        db: Sessão SQLAlchemy ativa.
+        authorization: Valor do header ``Authorization``.
+
+    Returns:
+        tuple: ``(email, role_efetiva_do_db, iat, principal)``.
+
+    Raises:
+        HTTPException (401): Se o token for inválido ou ausente.
     """
     now = int(time.time())
     email, _role_from_token, iat = _get_identity(authorization)
@@ -93,26 +150,87 @@ def _get_actor(
     return p.email, p.role, iat, p
 
 def _require_admin(email: str, role: str):
+    """Verifica se o ator possui privilégio de administrador.
+
+    Aceita o papel ``admin`` ou e-mail presente na lista
+    ``VAULT_ADMIN_EMAILS``. Lança exceção HTTP 403 caso contrário.
+
+    Args:
+        email: E-mail do ator.
+        role: Papel efetivo do ator (do banco de dados).
+
+    Raises:
+        HTTPException (403): Se o ator não for administrador.
+    """
     # aceita role admin (service token) OU email listado
     if role == "admin":
         return
     if email not in settings.VAULT_ADMIN_EMAILS:
         raise HTTPException(status_code=403, detail="Admin permission required.")
 
-@router.get("/me")
+@router.get("/me", summary="Obter identidade do usuário autenticado", description="Retorna e-mail, papel (role) e status do principal autenticado pelo token JWT.")
 def me(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Retorna os dados do principal autenticado.
+
+    Decodifica o token JWT enviado no header ``Authorization``,
+    consulta o banco de dados para obter o papel e status efetivos
+    e retorna essas informações.
+
+    **Headers obrigatórios:**
+    - ``Authorization: Bearer <jwt>``
+
+    **Resposta de sucesso (200):**
+    ```json
+    {
+      "email": "user@example.com",
+      "role": "admin",
+      "status": "active"
+    }
+    ```
+
+    **Erros:**
+    - **401**: Token ausente, inválido ou expirado.
+    """
     email, role, _iat, p = _get_actor(db, authorization)
     return {"email": p.email, "role": p.role, "status": p.status}
 
-@router.get("/secrets/{generic_secret}")
+@router.get("/secrets/{generic_secret}", summary="Ler segredo por nome genérico", description="Resolve o mapeamento genérico → real para o usuário autenticado e retorna o valor descriptografado.")
 def read_secret(
     generic_secret: str,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Lê e retorna o valor descriptografado de um segredo mapeado.
+
+    Fluxo completo:
+    1. Autentica o usuário via JWT.
+    2. Verifica se o principal está ativo e o token não foi revogado.
+    3. Resolve o ``generic_secret`` para o ``real_secret_name`` via
+       VIEW ``v_secret_resolution``.
+    4. Busca o segredo real e descriptografa com Fernet.
+    5. Registra a operação no audit log.
+
+    **Parâmetros:**
+    - **generic_secret** (path): Nome genérico do segredo solicitado.
+
+    **Resposta de sucesso (200):**
+    ```json
+    {
+      "generic_secret": "db_password",
+      "real_secret_name": "oracle_pwd_prod",
+      "value": "<texto_plano>",
+      "updated_at": 1708900000
+    }
+    ```
+
+    **Erros:**
+    - **401**: Token inválido, expirado ou revogado.
+    - **403**: Principal desabilitado.
+    - **404**: Nenhum mapeamento encontrado ou segredo inexistente/desabilitado.
+    """
     now = int(time.time())
     email, role, iat, p = _get_actor(db, authorization)
 
@@ -151,12 +269,35 @@ def read_secret(
     return {"generic_secret": generic_secret, "real_secret_name": real_name, "value": value, "updated_at": s.updated_at}
 
 
-@router.get("/secrets")
+@router.get("/secrets", summary="Ler múltiplos segredos (bulk)", description="Resolve e retorna os valores descriptografados de vários segredos genéricos de uma só vez.")
 def read_secrets_bulk(
-    names: str = Query(..., description="Comma-separated generic secret names"),
+    names: str = Query(..., description="Nomes genéricos separados por vírgula (ex: db_password,api_key)"),
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Lê múltiplos segredos de uma só vez, filtrando pelos mapeamentos do usuário.
+
+    Para cada nome genérico fornecido, tenta resolver o mapeamento do
+    usuário autenticado e descriptografar o valor. Segredos sem
+    mapeamento ou desabilitados são silenciosamente omitidos da resposta.
+
+    **Parâmetros:**
+    - **names** (query): Nomes genéricos separados por vírgula.
+
+    **Resposta de sucesso (200):**
+    ```json
+    {
+      "secrets": {
+        "db_password": "<valor>",
+        "api_key": "<valor>"
+      }
+    }
+    ```
+
+    **Erros:**
+    - **401**: Token inválido, expirado ou revogado.
+    - **403**: Principal desabilitado.
+    """
     now = int(time.time())
     email, role, iat, p = _get_actor(db, authorization)
     
@@ -187,12 +328,41 @@ def read_secrets_bulk(
     return {"secrets": result}
 
 
-@router.post("/real-secrets")
+@router.post("/real-secrets", summary="Criar/Atualizar segredo real", description="Cria ou atualiza um segredo real no Key Vault. Requer papel writer, admin ou service.")
 def admin_upsert_real_secret(
     payload: RealSecretUpsert,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Cria ou atualiza um segredo real no Key Vault (upsert).
+
+    O valor fornecido é criptografado com Fernet antes de ser persistido.
+    Verificações de RBAC:
+    - Apenas ``writer``, ``admin`` ou ``service`` podem gerenciar segredos.
+    - ``writer`` não pode criar/editar segredos com ``assign_level=admin``.
+    - ``writer`` não pode promover o ``assign_level`` de um segredo
+      existente para ``admin``.
+
+    **Body (JSON):**
+    ```json
+    {
+      "real_secret_name": "oracle_pwd_prod",
+      "value": "minha_senha_secreta",
+      "enabled": true,
+      "assign_level": "reader"
+    }
+    ```
+
+    **Resposta de sucesso (200):**
+    ```json
+    {"status": "ok", "real_secret_name": "oracle_pwd_prod"}
+    ```
+
+    **Erros:**
+    - **400**: ``assign_level`` inválido.
+    - **401**: Token inválido.
+    - **403**: Permissão insuficiente para a operação.
+    """
     now = int(time.time())
     actor_email, actor_role, _iat, p = _get_actor(db, authorization)
 
@@ -244,12 +414,41 @@ def admin_upsert_real_secret(
 
 
 
-@router.get("/admin/audit")
+@router.get("/admin/audit", summary="Listar log de auditoria", description="Retorna as entradas mais recentes do audit log. Restrito a administradores.")
 def admin_audit(
     limit: int = 200,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Lista as entradas mais recentes do log de auditoria do Key Vault.
+
+    Somente administradores (``role=admin`` ou e-mail em
+    ``VAULT_ADMIN_EMAILS``) podem acessar este endpoint.
+
+    **Parâmetros:**
+    - **limit** (query, default=200): Número máximo de registros a retornar.
+
+    **Resposta de sucesso (200):**
+    ```json
+    {
+      "rows": [
+        {
+          "ts": 1708900000,
+          "email": "user@example.com",
+          "action": "read_secret",
+          "status": "ok",
+          "generic_secret": "db_password",
+          "real_secret_name": "oracle_pwd_prod",
+          "details": null
+        }
+      ]
+    }
+    ```
+
+    **Erros:**
+    - **401**: Token inválido.
+    - **403**: Permissão de administrador requerida.
+    """
     actor_email, role, _iat, p = _get_actor(db, authorization)
     _require_admin(actor_email, role)
 
@@ -270,11 +469,35 @@ def admin_audit(
     }
 
 
-@router.get("/principals")
+@router.get("/principals", summary="Listar todos os principals", description="Retorna a lista completa de usuários (principals) cadastrados no sistema, ordenados por e-mail.")
 def admin_list_principals(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Lista todos os principals cadastrados no sistema.
+
+    Retorna os dados públicos de cada principal (e-mail, papel, status,
+    timestamps). A lista é ordenada alfabeticamente por e-mail.
+
+    **Resposta de sucesso (200):**
+    ```json
+    {
+      "principals": [
+        {
+          "email": "admin@example.com",
+          "role": "admin",
+          "status": "active",
+          "created_at": 1708900000,
+          "updated_at": 1708900000,
+          "token_valid_after": 0
+        }
+      ]
+    }
+    ```
+
+    **Erros:**
+    - **401**: Token inválido.
+    """
     actor_email, actor_role, _iat, actor_p = _get_actor(db, authorization)
     rows = db.execute(select(Principal).order_by(Principal.email.asc())).scalars().all()
 
@@ -298,12 +521,38 @@ def admin_list_principals(
     }
 
 
-@router.post("/principals")
+@router.post("/principals", summary="Criar/Atualizar principal", description="Cria ou atualiza um usuário (principal) com papel e status definidos. Requer papel writer, admin ou service.")
 def admin_upsert_principal(
     payload: PrincipalUpsert,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Cria ou atualiza um principal (usuário) no sistema.
+
+    Verificações de RBAC aplicadas:
+    - Apenas ``writer``, ``admin`` ou ``service`` podem gerenciar usuários.
+    - Não é possível atribuir um papel superior ao do próprio ator.
+    - Não é possível modificar usuários de papel superior ao do ator.
+
+    **Body (JSON):**
+    ```json
+    {
+      "email": "novo_usuario@example.com",
+      "role": "writer",
+      "status": "active"
+    }
+    ```
+
+    **Resposta de sucesso (200):**
+    ```json
+    {"status": "ok", "email": "novo_usuario@example.com"}
+    ```
+
+    **Erros:**
+    - **400**: E-mail inválido, role ou status não reconhecido.
+    - **401**: Token inválido.
+    - **403**: Permissão insuficiente.
+    """
     now = int(time.time())
     actor_email, actor_role, _iat, p = _get_actor(db, authorization)
 
@@ -365,11 +614,35 @@ def admin_upsert_principal(
     return {"status": "ok", "email": email}
 
 
-@router.get("/real-secrets")
+@router.get("/real-secrets", summary="Listar segredos reais", description="Retorna a lista de segredos reais visíveis ao ator, filtrados pelo assign_level compatível com seu papel.")
 def admin_list_real_secrets(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Lista todos os segredos reais acessíveis ao ator autenticado.
+
+    Retorna apenas os segredos cujo ``assign_level`` é compatível com
+    o papel do ator (ex: um ``writer`` vê segredos com
+    ``assign_level`` <= ``writer``, mas não ``admin``). O valor
+    criptografado **não** é retornado neste endpoint.
+
+    **Resposta de sucesso (200):**
+    ```json
+    {
+      "secrets": [
+        {
+          "real_secret_name": "oracle_pwd_prod",
+          "enabled": true,
+          "updated_at": 1708900000,
+          "assign_level": "reader"
+        }
+      ]
+    }
+    ```
+
+    **Erros:**
+    - **401**: Token inválido.
+    """
     actor_email, actor_role, _iat, _p = _get_actor(db, authorization)
 
     rows = db.execute(select(Secret).order_by(Secret.real_secret_name.asc())).scalars().all()
@@ -389,12 +662,43 @@ def admin_list_real_secrets(
     }
 
 
-@router.get("/mappings")
+@router.get("/mappings", summary="Listar mapeamentos de um usuário", description="Retorna todos os mapeamentos genérico → real de um usuário específico. Respeita hierarquia de papéis.")
 def admin_list_mappings(
     target_email: str,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Lista os mapeamentos de segredos de um usuário específico.
+
+    Retorna todos os mapeamentos (genérico → real) associados ao
+    e-mail informado. O ator só pode visualizar mapeamentos de
+    usuários com papel inferior ou igual ao seu.
+
+    **Parâmetros:**
+    - **target_email** (query): E-mail do usuário cujos mapeamentos
+      devem ser listados.
+
+    **Resposta de sucesso (200):**
+    ```json
+    {
+      "mappings": [
+        {
+          "email": "user@example.com",
+          "generic_secret": "db_password",
+          "real_secret_name": "oracle_pwd_prod",
+          "active": true,
+          "updated_at": 1708900000
+        }
+      ]
+    }
+    ```
+
+    **Erros:**
+    - **400**: E-mail inválido.
+    - **401**: Token inválido.
+    - **403**: Não permitido visualizar mapeamentos deste usuário.
+    - **404**: Principal-alvo não encontrado.
+    """
     actor_email, actor_role, _iat, _p = _get_actor(db, authorization)
 
     email = target_email.strip().lower()
@@ -429,12 +733,50 @@ def admin_list_mappings(
     }
 
 
-@router.post("/mappings/bulk")
+@router.post("/mappings/bulk", summary="Salvar mapeamentos em lote", description="Cria ou atualiza múltiplos mapeamentos genérico → real para um único usuário. Requer papel writer, admin ou service.")
 def admin_set_mappings_bulk(
     payload: MappingsBulk,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
+    """Salva múltiplos mapeamentos de segredos de uma só vez (bulk upsert).
+
+    Todos os itens devem pertencer ao mesmo e-mail (single-target).
+    Verificações de RBAC:
+    - Apenas ``writer``, ``admin`` ou ``service`` podem alterar mapeamentos.
+    - O ator não pode modificar mapeamentos de usuários com papel superior.
+    - O ator não pode atribuir segredos cujo ``assign_level`` exceda
+      seu próprio papel.
+
+    Se o principal-alvo não existir, ele é criado automaticamente
+    com papel ``user`` e status ``active``.
+
+    **Body (JSON):**
+    ```json
+    {
+      "items": [
+        {
+          "email": "user@example.com",
+          "generic_secret": "db_password",
+          "real_secret_name": "oracle_pwd_prod",
+          "active": true
+        }
+      ]
+    }
+    ```
+
+    **Resposta de sucesso (200):**
+    ```json
+    {"status": "ok", "saved": 3, "target_email": "user@example.com"}
+    ```
+
+    **Erros:**
+    - **400**: E-mail inválido ou itens com e-mails diferentes.
+    - **401**: Token inválido.
+    - **403**: Permissão insuficiente.
+    - **404**: Segredo real não encontrado.
+    - **500**: Falha ao salvar em lote.
+    """
     now = int(time.time())
     actor_email, actor_role, _iat, _p = _get_actor(db, authorization)
 
